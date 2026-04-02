@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mtrplotter"
+version = "0.1.0"
+description = "Plot medaka trimmed-read length distributions across samples for target loci."
+requires-python = ">=3.10"
+dependencies = ["matplotlib>=3.7"]
+
+[tool.setuptools.packages.find]
+include = ["mtrplotter*"]

@@ -26,9 +26,9 @@ Single locus:
 
 ```bash
 python -m mtrplotter \
-  --sample-table examples/smht001_ont_pacbio_samples.tsv \
+  --sample-table examples/samples.tsv \
   --region chr1:99682978-99683197 \
-  --output-dir demo_outputs/smht001_ont_pacbio_chr1_99682978_99683197_inline_metadata_jobs10 \
+  --output-dir demo_outputs/chr1_99682978_99683197 \
   --label-columns tissue_name tech core technology \
   --jobs 10
 ```
@@ -57,7 +57,7 @@ For TRGT rows, use the `medaka_folder` column as a generic input path. The most 
 
 ```tsv
 sample	medaka_folder	software	flank_bp
-SMHT001-3A-XX-M42-B001-broad	/path/to/trgt/SMHT001-3A-XX-M42-B001-broad	trgt	50
+SAMPLE001	/path/to/trgt/SAMPLE001	trgt	50
 ```
 
 `mTRplotter` resolves the sibling files:

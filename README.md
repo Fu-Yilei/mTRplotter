@@ -1,6 +1,14 @@
 # mTRplotter
 
+[![PyPI](https://img.shields.io/pypi/v/mtrplotter)](https://pypi.org/project/mtrplotter/)
+
 `mTRplotter` turns the read-length plotting logic from the notebook into a small Python CLI.
+
+## Installation
+
+```bash
+pip install mtrplotter
+```
 
 It expects a tab-delimited sample table with at least:
 

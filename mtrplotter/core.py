@@ -12,6 +12,7 @@ from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
+import tempfile
 
 REGION_RE = re.compile(r"(chr[^_]+_\d+_\d+)")
 HAP_RE = re.compile(r"_(hap\d+)_phased-set")
@@ -24,6 +25,12 @@ PLOT_PALETTE = {
 REQUIRED_SAMPLE_COLUMNS = {"sample", "medaka_folder", "software", "flank_bp"}
 CONTROL_SAMPLE_COLUMNS = {"sample", "medaka_folder", "software", "flank_bp"}
 SUPPORTED_SOFTWARE = {"medaka", "trgt"}
+
+
+def get_output_tmp_dir(output_dir: Path) -> Path:
+    tmp_dir = output_dir / ".tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    return tmp_dir
 
 
 @dataclass(frozen=True)
@@ -151,7 +158,9 @@ def resolve_trgt_sample_files(sample: SampleConfig) -> TRGTSampleFiles:
     if sample_path.is_dir():
         candidate_bams.extend(
             [
+                sample_path / f"{sample.sample}.trgt.spanning.sorted.bam",
                 sample_path / f"{sample.sample}.trgt.spanning.bam",
+                *sorted(sample_path.glob(f"{sample.sample}*.trgt.spanning.sorted.bam")),
                 *sorted(sample_path.glob(f"{sample.sample}*.trgt.spanning.bam")),
             ]
         )
@@ -165,6 +174,7 @@ def resolve_trgt_sample_files(sample: SampleConfig) -> TRGTSampleFiles:
         sample_path_text = str(sample_path)
         prefix_texts: list[str] = []
         if sample_path_text.endswith(".trgt.spanning.bam"):
+            candidate_bams.append(Path(sample_path_text[: -len(".bam")] + ".sorted.bam"))
             candidate_bams.append(sample_path)
             prefix_texts.append(sample_path_text[: -len(".spanning.bam")])
         elif sample_path_text.endswith(".trgt.vcf.gz"):
@@ -176,6 +186,7 @@ def resolve_trgt_sample_files(sample: SampleConfig) -> TRGTSampleFiles:
             prefix_texts.extend([sample_path_text, f"{sample_path_text}.trgt"])
 
         for prefix_text in prefix_texts:
+            candidate_bams.append(Path(f"{prefix_text}.spanning.sorted.bam"))
             candidate_bams.append(Path(f"{prefix_text}.spanning.bam"))
             candidate_vcfs.append(Path(f"{prefix_text}.vcf.gz"))
 
@@ -653,6 +664,7 @@ def collect_sample_read_rows_from_trgt_bam(
     target_lookup: dict[str, TargetRegion],
     target_trids_by_region: dict[str, list[str]],
     keep_length_one: bool,
+    temp_dir: Path,
 ) -> tuple[str, list[dict[str, str | int]]]:
     trgt_files = resolve_trgt_sample_files(sample)
 
@@ -670,17 +682,62 @@ def collect_sample_read_rows_from_trgt_bam(
     if not region_by_trid:
         return sample.sample, []
 
-    read_rows: list[dict[str, str | int]] = []
-    for trid, region in region_by_trid.items():
+    command: list[str]
+    temporary_bed_path: Path | None = None
+    bam_index_path = Path(f"{trgt_files.spanning_bam}.bai")
+    if not bam_index_path.is_file():
+        print(
+            f"[warning] TRGT spanning BAM for {sample.sample} has no index "
+            f"({trgt_files.spanning_bam}); sort and index it with "
+            f"'samtools sort' + 'samtools index' to avoid scanning the full BAM file.",
+            flush=True,
+        )
+    if bam_index_path.is_file():
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            suffix=".bed",
+            prefix=f"{sample.sample}.",
+            dir=temp_dir,
+            delete=False,
+        ) as temporary_bed_handle:
+            for region in sorted(set(region_by_trid.values())):
+                target = target_lookup[region]
+                temporary_bed_handle.write(
+                    f"{target.chrom}\t{target.start}\t{target.end}\n"
+                )
+        temporary_bed_path = Path(temporary_bed_handle.name)
+        command = [
+            "samtools",
+            "view",
+            "-F",
+            "2304",
+            "-M",
+            "-L",
+            str(temporary_bed_path),
+            str(trgt_files.spanning_bam),
+        ]
+    elif len(region_by_trid) == 1:
+        trid_filter = next(iter(region_by_trid))
         command = [
             "samtools",
             "view",
             "-F",
             "2304",
             "-d",
-            f"TR:{trid}",
+            f"TR:{trid_filter}",
             str(trgt_files.spanning_bam),
         ]
+    else:
+        command = [
+            "samtools",
+            "view",
+            "-F",
+            "2304",
+            str(trgt_files.spanning_bam),
+        ]
+
+    read_rows: list[dict[str, str | int]] = []
+    try:
         for line in stream_command_lines(command):
             if not line:
                 continue
@@ -693,7 +750,12 @@ def collect_sample_read_rows_from_trgt_bam(
                 continue
 
             tags = parse_optional_tags(fields[11:])
-            if tags.get("TR") != trid:
+            trid = tags.get("TR")
+            if not trid:
+                continue
+
+            region = region_by_trid.get(trid)
+            if region is None:
                 continue
 
             raw_read_length = len(sequence)
@@ -727,6 +789,9 @@ def collect_sample_read_rows_from_trgt_bam(
             for key, value in sample.metadata.items():
                 row[key] = value
             read_rows.append(row)
+    finally:
+        if temporary_bed_path is not None and temporary_bed_path.exists():
+            temporary_bed_path.unlink()
 
     return sample.sample, read_rows
 
@@ -736,6 +801,7 @@ def collect_rows_for_sample(
     target_lookup: dict[str, TargetRegion],
     keep_length_one: bool,
     target_matches_by_region: dict[str, list[str]],
+    temp_dir: Path,
 ) -> tuple[str, list[dict[str, str | int]]]:
     if sample.software == "trgt":
         return collect_sample_read_rows_from_trgt_bam(
@@ -743,6 +809,7 @@ def collect_rows_for_sample(
             target_lookup=target_lookup,
             target_trids_by_region=target_matches_by_region,
             keep_length_one=keep_length_one,
+            temp_dir=temp_dir,
         )
 
     return collect_sample_read_rows_from_bam(
@@ -759,6 +826,7 @@ def collect_read_rows(
     keep_length_one: bool,
     jobs: int,
     target_chunks_by_sample: dict[str, dict[str, list[str]]],
+    temp_dir: Path,
 ) -> list[dict[str, str | int]]:
     target_lookup = {target.region: target for target in targets}
     read_rows: list[dict[str, str | int]] = []
@@ -772,6 +840,7 @@ def collect_read_rows(
                 target_lookup=target_lookup,
                 keep_length_one=keep_length_one,
                 target_matches_by_region=target_chunks_by_sample[sample.sample],
+                temp_dir=temp_dir,
             )
             sample_rows[sample_name] = rows
     else:
@@ -784,6 +853,7 @@ def collect_read_rows(
                     target_lookup,
                     keep_length_one,
                     target_chunks_by_sample[sample.sample],
+                    temp_dir,
                 )
                 futures[future] = sample.sample
             for completed_index, future in enumerate(as_completed(futures), start=1):
@@ -1002,6 +1072,7 @@ def run_workflow(
     samples = load_sample_table(sample_table_path=sample_table_path)
     targets = load_targets(region_text=region_text, bed_path=bed_path)
     output_dir.mkdir(parents=True, exist_ok=True)
+    temp_dir = get_output_tmp_dir(output_dir)
 
     validation_rows, target_chunks_by_sample = validate_targets(
         samples=samples,
@@ -1016,6 +1087,7 @@ def run_workflow(
         keep_length_one=keep_length_one,
         jobs=jobs,
         target_chunks_by_sample=target_chunks_by_sample,
+        temp_dir=temp_dir,
     )
     if not read_rows:
         raise ValueError("No reads matched the requested loci.")

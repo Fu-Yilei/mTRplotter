@@ -360,6 +360,82 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual({row["hap"] for row in rows_by_sample["sampleT"]}, {"hap1", "hap2"})
         self.assertEqual({row["flank_bp"] for row in rows_by_sample["sampleT"]}, {"2"})
 
+    @unittest.skipUnless(shutil.which("samtools"), "samtools not available")
+    def test_run_workflow_supports_multi_region_trgt_bed_input(self) -> None:
+        trgt_prefix = self.root / "sampleT"
+        vcf_text = (
+            "##fileformat=VCFv4.2\n"
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n"
+            "chr1\t10\t.\tA\t<TR>\t.\tPASS\tTRID=12;END=20\tGT\t0/1\n"
+            "chr1\t30\t.\tA\t<TR>\t.\tPASS\tTRID=34;END=40\tGT\t0/1\n"
+        )
+        self.write_gzip_text(Path(f"{trgt_prefix}.trgt.vcf.gz"), vcf_text)
+
+        sam_text = (
+            "@HD\tVN:1.6\tSO:coordinate\n"
+            "@SQ\tSN:chr1\tLN:1000\n"
+            "tr1\t0\tchr1\t10\t60\t10M\t*\t0\t0\tAAAAAAAAAA\t*\tTR:Z:12\tHP:i:1\n"
+            "tr2\t0\tchr1\t30\t60\t12M\t*\t0\t0\tAAAAAAAAAAAA\t*\tTR:Z:34\tHP:i:2\n"
+            "off_target\t0\tchr1\t30\t60\t8M\t*\t0\t0\tAAAAAAAA\t*\tTR:Z:99\tHP:i:1\n"
+        )
+        sam_path = Path(f"{trgt_prefix}.trgt.spanning.sam")
+        bam_path = Path(f"{trgt_prefix}.trgt.spanning.bam")
+        self.write_text(sam_path, sam_text)
+        subprocess.run(
+            [
+                "samtools",
+                "view",
+                "-b",
+                "-o",
+                str(bam_path),
+                str(sam_path),
+            ],
+            check=True,
+        )
+        sorted_bam_path = Path(f"{trgt_prefix}.trgt.spanning.sorted.bam")
+        subprocess.run(
+            [
+                "samtools",
+                "sort",
+                "-o",
+                str(sorted_bam_path),
+                str(bam_path),
+            ],
+            check=True,
+        )
+        subprocess.run(["samtools", "index", str(sorted_bam_path)], check=True)
+
+        sample_table = self.write_sample_table(
+            [
+                {
+                    "sample": "sampleT",
+                    "medaka_folder": str(trgt_prefix),
+                    "software": "trgt",
+                    "flank_bp": "2",
+                },
+            ]
+        )
+        bed_path = self.root / "targets.bed"
+        self.write_text(bed_path, "chr1\t10\t20\nchr1\t30\t40\n")
+
+        output_dir = self.root / "multi_region_trgt_outputs"
+        result = run_workflow(
+            sample_table_path=sample_table,
+            output_dir=output_dir,
+            bed_path=bed_path,
+            label_columns=["sample", "software"],
+        )
+
+        with gzip.open(result["reads_tsv_path"], "rt") as handle:
+            rows = list(csv.DictReader(handle, delimiter="\t"))
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({row["region"] for row in rows}, {"chr1_10_20", "chr1_30_40"})
+        self.assertEqual({row["hap"] for row in rows}, {"hap1", "hap2"})
+        temp_dir = output_dir / ".tmp"
+        self.assertTrue(temp_dir.is_dir())
+        self.assertEqual(list(temp_dir.iterdir()), [])
+
 
 if __name__ == "__main__":
     unittest.main()

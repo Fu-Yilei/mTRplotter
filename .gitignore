@@ -14,3 +14,4 @@ venv/
 .ipynb_checkpoints/
 .DS_Store
 demo_outputs/
+examples/

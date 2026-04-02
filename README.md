@@ -57,7 +57,7 @@ For TRGT rows, use the `medaka_folder` column as a generic input path. The most 
 
 ```tsv
 sample	medaka_folder	software	flank_bp
-SMHT001-3A-XX-M42-B001-broad	/stornext/snfs130/fritz/Yilei/SMaHT/tr/trgt/SMHT001-3A-XX-M42-B001-broad	trgt	50
+SMHT001-3A-XX-M42-B001-broad	/path/to/trgt/SMHT001-3A-XX-M42-B001-broad	trgt	50
 ```
 
 `mTRplotter` resolves the sibling files:

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import csv
 import gzip
+import json
+import logging
 import random
 import re
 import shutil
@@ -11,6 +13,7 @@ from collections import defaultdict
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 import tempfile
 
@@ -25,12 +28,68 @@ PLOT_PALETTE = {
 REQUIRED_SAMPLE_COLUMNS = {"sample", "medaka_folder", "software", "flank_bp"}
 CONTROL_SAMPLE_COLUMNS = {"sample", "medaka_folder", "software", "flank_bp"}
 SUPPORTED_SOFTWARE = {"medaka", "trgt"}
+LOGGER = logging.getLogger("mtrplotter")
+LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
 
 
 def get_output_tmp_dir(output_dir: Path) -> Path:
     tmp_dir = output_dir / ".tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
     return tmp_dir
+
+
+def serialize_optional_path(path: Path | None) -> str | None:
+    if path is None:
+        return None
+    return str(path.resolve())
+
+
+def build_run_parameters(
+    sample_table_path: Path,
+    output_dir: Path,
+    region_text: str | None,
+    bed_path: Path | None,
+    catalog_bed_path: Path | None,
+    label_columns: list[str],
+    keep_length_one: bool,
+    require_region_in_all_samples: bool,
+    figure_prefix: str,
+    jobs: int,
+) -> dict[str, object]:
+    return {
+        "sample_table_path": str(sample_table_path.resolve()),
+        "output_dir": str(output_dir.resolve()),
+        "working_directory": str(Path.cwd().resolve()),
+        "region_text": region_text,
+        "bed_path": serialize_optional_path(bed_path),
+        "catalog_bed_path": serialize_optional_path(catalog_bed_path),
+        "label_columns": label_columns,
+        "keep_length_one": keep_length_one,
+        "require_region_in_all_samples": require_region_in_all_samples,
+        "figure_prefix": figure_prefix,
+        "jobs": jobs,
+        "started_at_utc": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def write_json(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+
+def attach_log_handler(log_path: Path) -> logging.Handler:
+    LOGGER.setLevel(logging.INFO)
+    LOGGER.propagate = False
+
+    handler = logging.FileHandler(log_path, mode="w")
+    handler.setFormatter(logging.Formatter(LOG_FORMAT))
+    LOGGER.addHandler(handler)
+    return handler
+
+
+def detach_log_handler(handler: logging.Handler) -> None:
+    LOGGER.removeHandler(handler)
+    handler.close()
 
 
 @dataclass(frozen=True)
@@ -484,9 +543,11 @@ def validate_targets(
             for completed_index, future in enumerate(as_completed(futures), start=1):
                 sample_name, found_entries = future.result()
                 found_chunks_by_sample[sample_name] = found_entries
-                print(
-                    f"[validate] completed {completed_index}/{len(samples)}: {sample_name}",
-                    flush=True,
+                LOGGER.info(
+                    "[validate] completed %s/%s: %s",
+                    completed_index,
+                    len(samples),
+                    sample_name,
                 )
 
     missing_by_sample: dict[str, list[str]] = {}
@@ -686,11 +747,11 @@ def collect_sample_read_rows_from_trgt_bam(
     temporary_bed_path: Path | None = None
     bam_index_path = Path(f"{trgt_files.spanning_bam}.bai")
     if not bam_index_path.is_file():
-        print(
-            f"[warning] TRGT spanning BAM for {sample.sample} has no index "
-            f"({trgt_files.spanning_bam}); sort and index it with "
-            f"'samtools sort' + 'samtools index' to avoid scanning the full BAM file.",
-            flush=True,
+        LOGGER.warning(
+            "TRGT spanning BAM for %s has no index (%s); sort and index it with "
+            "'samtools sort' + 'samtools index' to avoid scanning the full BAM file.",
+            sample.sample,
+            trgt_files.spanning_bam,
         )
     if bam_index_path.is_file():
         with tempfile.NamedTemporaryFile(
@@ -859,9 +920,11 @@ def collect_read_rows(
             for completed_index, future in enumerate(as_completed(futures), start=1):
                 sample_name, rows = future.result()
                 sample_rows[sample_name] = rows
-                print(
-                    f"[collect] completed {completed_index}/{len(samples)}: {sample_name}",
-                    flush=True,
+                LOGGER.info(
+                    "[collect] completed %s/%s: %s",
+                    completed_index,
+                    len(samples),
+                    sample_name,
                 )
 
     for sample in samples:
@@ -1068,54 +1131,95 @@ def run_workflow(
     jobs: int = 1,
 ) -> dict[str, object]:
     labels = label_columns or ["sample"]
-    ensure_bam_tools_available()
-    samples = load_sample_table(sample_table_path=sample_table_path)
-    targets = load_targets(region_text=region_text, bed_path=bed_path)
+    output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    temp_dir = get_output_tmp_dir(output_dir)
+    params_path = output_dir / "params.json"
+    log_path = output_dir / "log.out"
+    log_handler = attach_log_handler(log_path)
 
-    validation_rows, target_chunks_by_sample = validate_targets(
-        samples=samples,
-        targets=targets,
-        catalog_bed_path=catalog_bed_path,
-        require_region_in_all_samples=require_region_in_all_samples,
-        jobs=jobs,
-    )
-    read_rows = collect_read_rows(
-        samples=samples,
-        targets=targets,
-        keep_length_one=keep_length_one,
-        jobs=jobs,
-        target_chunks_by_sample=target_chunks_by_sample,
-        temp_dir=temp_dir,
-    )
-    if not read_rows:
-        raise ValueError("No reads matched the requested loci.")
-
-    summary_rows = summarize_read_rows(read_rows)
-    figure_paths = [
-        plot_target_region(
-            read_rows=read_rows,
-            target=target,
-            samples=samples,
+    try:
+        run_parameters = build_run_parameters(
+            sample_table_path=sample_table_path,
             output_dir=output_dir,
+            region_text=region_text,
+            bed_path=bed_path,
+            catalog_bed_path=catalog_bed_path,
             label_columns=labels,
+            keep_length_one=keep_length_one,
+            require_region_in_all_samples=require_region_in_all_samples,
             figure_prefix=figure_prefix,
+            jobs=jobs,
         )
-        for target in targets
-    ]
+        write_json(params_path, run_parameters)
+        LOGGER.info("Run started")
+        LOGGER.info("Parameters written to %s", params_path)
 
-    reads_tsv_path = output_dir / "per_read_lengths.tsv.gz"
-    summary_tsv_path = output_dir / "read_length_summary.tsv"
-    validation_tsv_path = output_dir / "region_validation.tsv"
-    write_tsv(reads_tsv_path, read_rows)
-    write_tsv(summary_tsv_path, summary_rows)
-    write_tsv(validation_tsv_path, validation_rows)
+        ensure_bam_tools_available()
+        samples = load_sample_table(sample_table_path=sample_table_path)
+        targets = load_targets(region_text=region_text, bed_path=bed_path)
+        temp_dir = get_output_tmp_dir(output_dir)
+        LOGGER.info(
+            "Loaded %s sample(s) and %s target(s) into %s",
+            len(samples),
+            len(targets),
+            output_dir,
+        )
 
-    return {
-        "figure_paths": figure_paths,
-        "reads_tsv_path": reads_tsv_path,
-        "summary_tsv_path": summary_tsv_path,
-        "validation_tsv_path": validation_tsv_path,
-        "read_source": "bam",
-    }
+        validation_rows, target_chunks_by_sample = validate_targets(
+            samples=samples,
+            targets=targets,
+            catalog_bed_path=catalog_bed_path,
+            require_region_in_all_samples=require_region_in_all_samples,
+            jobs=jobs,
+        )
+        read_rows = collect_read_rows(
+            samples=samples,
+            targets=targets,
+            keep_length_one=keep_length_one,
+            jobs=jobs,
+            target_chunks_by_sample=target_chunks_by_sample,
+            temp_dir=temp_dir,
+        )
+        if not read_rows:
+            raise ValueError("No reads matched the requested loci.")
+
+        summary_rows = summarize_read_rows(read_rows)
+        figure_paths = [
+            plot_target_region(
+                read_rows=read_rows,
+                target=target,
+                samples=samples,
+                output_dir=output_dir,
+                label_columns=labels,
+                figure_prefix=figure_prefix,
+            )
+            for target in targets
+        ]
+
+        reads_tsv_path = output_dir / "per_read_lengths.tsv.gz"
+        summary_tsv_path = output_dir / "read_length_summary.tsv"
+        validation_tsv_path = output_dir / "region_validation.tsv"
+        write_tsv(reads_tsv_path, read_rows)
+        write_tsv(summary_tsv_path, summary_rows)
+        write_tsv(validation_tsv_path, validation_rows)
+        LOGGER.info(
+            "Run completed with %s read row(s), %s summary row(s), and %s figure(s)",
+            len(read_rows),
+            len(summary_rows),
+            len(figure_paths),
+        )
+
+        return {
+            "figure_paths": figure_paths,
+            "reads_tsv_path": reads_tsv_path,
+            "summary_tsv_path": summary_tsv_path,
+            "validation_tsv_path": validation_tsv_path,
+            "params_path": params_path,
+            "log_path": log_path,
+            "read_source": "bam",
+        }
+    except Exception:
+        LOGGER.exception("Workflow failed")
+        raise
+    finally:
+        detach_log_handler(log_handler)

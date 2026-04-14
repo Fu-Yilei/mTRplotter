@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import csv
 import gzip
+import json
 import shutil
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
+from mtrplotter.cli import build_parser
 from mtrplotter.core import TargetRegion, run_workflow
 
 
@@ -171,12 +173,23 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(result["summary_tsv_path"].is_file())
         self.assertTrue(result["validation_tsv_path"].is_file())
         self.assertTrue(result["reads_tsv_path"].is_file())
+        self.assertTrue(result["params_path"].is_file())
+        self.assertTrue(result["log_path"].is_file())
 
         with gzip.open(result["reads_tsv_path"], "rt") as handle:
             rows = list(csv.DictReader(handle, delimiter="\t"))
         self.assertEqual(len(rows), 4)
         self.assertEqual({row["hap"] for row in rows}, {"hap1", "hap2"})
         self.assertEqual(rows[0]["flank_bp"], "0")
+
+        params = json.loads(result["params_path"].read_text())
+        self.assertEqual(params["output_dir"], str(output_dir.resolve()))
+        self.assertEqual(params["region_text"], "chr1:10-20")
+        self.assertEqual(params["label_columns"], ["sample", "batch"])
+
+        log_text = result["log_path"].read_text()
+        self.assertIn("Run started", log_text)
+        self.assertIn("Run completed", log_text)
 
     @unittest.skipUnless(shutil.which("samtools"), "samtools not available")
     def test_run_workflow_uses_inline_metadata_columns(self) -> None:
@@ -289,6 +302,19 @@ class WorkflowTests(unittest.TestCase):
                 output_dir=self.root / "invalid_outputs",
                 region_text="chr1:10-20",
             )
+
+    def test_cli_output_dir_defaults_to_current_working_directory(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "--sample-table",
+                "samples.tsv",
+                "--region",
+                "chr1:10-20",
+            ]
+        )
+
+        self.assertIsNone(args.output_dir)
 
     @unittest.skipUnless(shutil.which("samtools"), "samtools not available")
     def test_run_workflow_supports_mixed_medaka_and_trgt_inputs(self) -> None:

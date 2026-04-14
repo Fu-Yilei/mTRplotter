@@ -36,9 +36,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument(
         "--output-dir",
-        required=True,
         type=Path,
-        help="Directory for figures and tabular outputs.",
+        help="Directory for figures, tables, params.json, and log.out. Default: current working directory.",
     )
     parser.add_argument(
         "--catalog-bed",
@@ -81,10 +80,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    output_dir = (args.output_dir or Path.cwd()).resolve()
 
     result = run_workflow(
         sample_table_path=args.sample_table,
-        output_dir=args.output_dir,
+        output_dir=output_dir,
         region_text=args.region,
         bed_path=args.bed,
         catalog_bed_path=args.catalog_bed,
@@ -101,4 +101,6 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Per-read table: {result['reads_tsv_path']}")
     print(f"Summary table: {result['summary_tsv_path']}")
     print(f"Validation table: {result['validation_tsv_path']}")
+    print(f"Parameters: {result['params_path']}")
+    print(f"Log: {result['log_path']}")
     return 0

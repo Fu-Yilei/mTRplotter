@@ -4,6 +4,8 @@
 
 `mTRplotter` turns the read-length plotting logic from the notebook into a small Python CLI.
 
+Each run also writes `params.json` and `log.out` alongside the figure and TSV outputs so the command parameters and progress logs stay with the generated results.
+
 ## Installation
 
 ```bash
@@ -17,6 +19,8 @@ It expects a tab-delimited sample table with at least:
 - `software` (`medaka` or `trgt`)
 - `flank_bp`
 - any number of extra metadata columns
+
+If `--output-dir` is omitted, `mTRplotter` writes all outputs to the current working directory.
 
 For each requested locus, it:
 
@@ -36,7 +40,6 @@ Single locus:
 python -m mtrplotter \
   --sample-table examples/samples.tsv \
   --region chr1:99682978-99683197 \
-  --output-dir demo_outputs/chr1_99682978_99683197 \
   --label-columns tissue_name tech core technology \
   --jobs 10
 ```

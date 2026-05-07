@@ -19,6 +19,7 @@ import tempfile
 
 REGION_RE = re.compile(r"(chr[^_]+_\d+_\d+)")
 HAP_RE = re.compile(r"_(hap\d+)_phased-set")
+PAD_RE = re.compile(r"_pad_(\d+)_(\d+)_")
 REGION_TEXT_RE = re.compile(r"^(chr[^:]+)[:_](\d+)[-_](\d+)$")
 PLOT_PALETTE = {
     "hap1": "#4C78A8",
@@ -55,6 +56,18 @@ def build_run_parameters(
     require_region_in_all_samples: bool,
     figure_prefix: str,
     jobs: int,
+    use_fasta: bool = False,
+    label_rotation: int = 0,
+    fontsize: int = 11,
+    no_haplotype_color: bool = False,
+    color_column: str | None = None,
+    sort_columns: list[str] | None = None,
+    sample_separators: bool = False,
+    separator_column: str | None = None,
+    group_label_column: str | None = None,
+    figure_width_per_sample: float = 1.1,
+    figure_height: float = 8.0,
+    subtract_reference_allele: bool = False,
 ) -> dict[str, object]:
     return {
         "sample_table_path": str(sample_table_path.resolve()),
@@ -68,6 +81,18 @@ def build_run_parameters(
         "require_region_in_all_samples": require_region_in_all_samples,
         "figure_prefix": figure_prefix,
         "jobs": jobs,
+        "use_fasta": use_fasta,
+        "label_rotation": label_rotation,
+        "fontsize": fontsize,
+        "no_haplotype_color": no_haplotype_color,
+        "color_column": color_column,
+        "sort_columns": sort_columns,
+        "sample_separators": sample_separators,
+        "separator_column": separator_column,
+        "group_label_column": group_label_column,
+        "figure_width_per_sample": figure_width_per_sample,
+        "figure_height": figure_height,
+        "subtract_reference_allele": subtract_reference_allele,
         "started_at_utc": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -163,6 +188,10 @@ class SampleConfig:
     @property
     def trimmed_reads_bam_index(self) -> Path:
         return self.medaka_folder / "trimmed_reads_to_poa.bam.bai"
+
+    @property
+    def trimmed_reads_fasta(self) -> Path:
+        return self.medaka_folder / "trimmed_reads.fasta"
 
 
 @dataclass(frozen=True)
@@ -268,6 +297,7 @@ def resolve_trgt_sample_files(sample: SampleConfig) -> TRGTSampleFiles:
 
 def load_sample_table(
     sample_table_path: Path,
+    use_fasta: bool = False,
 ) -> list[SampleConfig]:
     samples: list[SampleConfig] = []
 
@@ -329,7 +359,7 @@ def load_sample_table(
                 flank_bp=flank_bp,
                 metadata=merged_metadata,
             )
-            ensure_sample_paths_exist(sample)
+            ensure_sample_paths_exist(sample, use_fasta=use_fasta)
             samples.append(sample)
 
     if not samples:
@@ -337,7 +367,7 @@ def load_sample_table(
     return samples
 
 
-def ensure_sample_paths_exist(sample: SampleConfig) -> None:
+def ensure_sample_paths_exist(sample: SampleConfig, use_fasta: bool = False) -> None:
     if sample.software == "medaka":
         if not sample.medaka_folder.is_dir():
             raise FileNotFoundError(
@@ -347,16 +377,23 @@ def ensure_sample_paths_exist(sample: SampleConfig) -> None:
             raise FileNotFoundError(
                 f"Missing ref_chunks.fasta for sample {sample.sample}: {sample.ref_chunks_fasta}"
             )
-        if not sample.trimmed_reads_bam.is_file():
-            raise FileNotFoundError(
-                f"Missing trimmed_reads_to_poa.bam for sample {sample.sample}: "
-                f"{sample.trimmed_reads_bam}"
-            )
-        if not sample.trimmed_reads_bam_index.is_file():
-            raise FileNotFoundError(
-                f"Missing trimmed_reads_to_poa.bam.bai for sample {sample.sample}: "
-                f"{sample.trimmed_reads_bam_index}"
-            )
+        if use_fasta:
+            if not sample.trimmed_reads_fasta.is_file():
+                raise FileNotFoundError(
+                    f"Missing trimmed_reads.fasta for sample {sample.sample}: "
+                    f"{sample.trimmed_reads_fasta}"
+                )
+        else:
+            if not sample.trimmed_reads_bam.is_file():
+                raise FileNotFoundError(
+                    f"Missing trimmed_reads_to_poa.bam for sample {sample.sample}: "
+                    f"{sample.trimmed_reads_bam}"
+                )
+            if not sample.trimmed_reads_bam_index.is_file():
+                raise FileNotFoundError(
+                    f"Missing trimmed_reads_to_poa.bam.bai for sample {sample.sample}: "
+                    f"{sample.trimmed_reads_bam_index}"
+                )
         return
 
     if sample.software == "trgt":
@@ -409,6 +446,20 @@ def load_catalog_regions(catalog_bed_path: Path) -> set[str]:
             target = TargetRegion.from_bed_fields(fields)
             catalog_regions.add(target.region)
     return catalog_regions
+
+
+def load_catalog_reference_sizes(catalog_bed_path: Path) -> dict[str, int]:
+    """Map each catalog region to its reference allele size (end - start)."""
+    reference_sizes: dict[str, int] = {}
+    with catalog_bed_path.open() as handle:
+        for line in handle:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            fields = stripped.split("\t")
+            target = TargetRegion.from_bed_fields(fields)
+            reference_sizes[target.region] = target.end - target.start
+    return reference_sizes
 
 
 def resolve_jobs(jobs: int, item_count: int) -> int:
@@ -857,13 +908,103 @@ def collect_sample_read_rows_from_trgt_bam(
     return sample.sample, read_rows
 
 
+def collect_sample_read_rows_from_fasta(
+    sample: SampleConfig,
+    target_lookup: dict[str, TargetRegion],
+    keep_length_one: bool,
+) -> tuple[str, list[dict[str, str | int]]]:
+    """Extract per-read lengths from trimmed_reads.fasta.
+
+    Unlike the BAM path, this includes reads that failed to align to the POA
+    consensus (e.g. rare somatic expansions that are dramatically longer than
+    the dominant allele and were dropped from trimmed_reads_to_poa.bam).
+    Flank sizes are computed per-read from the pad coordinates embedded in
+    each FASTA header rather than using the sample-level flank_bp.
+    """
+    fasta_path = sample.trimmed_reads_fasta
+    target_regions = set(target_lookup)
+    read_rows: list[dict[str, str | int]] = []
+
+    current_header: str | None = None
+    current_seq_len = 0
+
+    def flush(header: str, seq_len: int) -> None:
+        region_match = REGION_RE.search(header)
+        if not region_match:
+            return
+        region = region_match.group(1)
+        if region not in target_regions:
+            return
+
+        target = target_lookup[region]
+        if not keep_length_one and seq_len == 1:
+            return
+
+        pad_match = PAD_RE.search(header)
+        if pad_match:
+            pad_start = int(pad_match.group(1))
+            pad_end = int(pad_match.group(2))
+            flank_left = max(0, target.start - pad_start)
+            flank_right = max(0, pad_end - target.end)
+        else:
+            flank_left = sample.flank_bp
+            flank_right = sample.flank_bp
+
+        adjusted_read_length = seq_len - flank_left - flank_right
+        representative_flank_bp = flank_left if flank_left == flank_right else sample.flank_bp
+
+        row: dict[str, str | int] = {
+            "sample": sample.sample,
+            "medaka_folder": str(sample.medaka_folder),
+            "software": sample.software,
+            "chrom": target.chrom,
+            "start": target.start,
+            "end": target.end,
+            "region": target.region,
+            "igv_locus": target.igv_locus,
+            "hap": parse_haplotype(header),
+            "raw_read_length": seq_len,
+            "flank_bp": representative_flank_bp,
+            "flank_left_bp": flank_left,
+            "flank_right_bp": flank_right,
+            "read_length": adjusted_read_length,
+        }
+        for key, value in sample.metadata.items():
+            row[key] = value
+        read_rows.append(row)
+
+    with fasta_path.open() as fh:
+        for line in fh:
+            line = line.rstrip()
+            if line.startswith(">"):
+                if current_header is not None:
+                    flush(current_header, current_seq_len)
+                current_header = line[1:]
+                current_seq_len = 0
+            elif current_header is not None:
+                current_seq_len += len(line)
+
+    if current_header is not None:
+        flush(current_header, current_seq_len)
+
+    return sample.sample, read_rows
+
+
 def collect_rows_for_sample(
     sample: SampleConfig,
     target_lookup: dict[str, TargetRegion],
     keep_length_one: bool,
     target_matches_by_region: dict[str, list[str]],
     temp_dir: Path,
+    use_fasta: bool = False,
 ) -> tuple[str, list[dict[str, str | int]]]:
+    if use_fasta and sample.software == "medaka":
+        return collect_sample_read_rows_from_fasta(
+            sample=sample,
+            target_lookup=target_lookup,
+            keep_length_one=keep_length_one,
+        )
+
     if sample.software == "trgt":
         return collect_sample_read_rows_from_trgt_bam(
             sample=sample,
@@ -888,6 +1029,7 @@ def collect_read_rows(
     jobs: int,
     target_chunks_by_sample: dict[str, dict[str, list[str]]],
     temp_dir: Path,
+    use_fasta: bool = False,
 ) -> list[dict[str, str | int]]:
     target_lookup = {target.region: target for target in targets}
     read_rows: list[dict[str, str | int]] = []
@@ -902,6 +1044,7 @@ def collect_read_rows(
                 keep_length_one=keep_length_one,
                 target_matches_by_region=target_chunks_by_sample[sample.sample],
                 temp_dir=temp_dir,
+                use_fasta=use_fasta,
             )
             sample_rows[sample_name] = rows
     else:
@@ -915,6 +1058,7 @@ def collect_read_rows(
                     keep_length_one,
                     target_chunks_by_sample[sample.sample],
                     temp_dir,
+                    use_fasta,
                 )
                 futures[future] = sample.sample
             for completed_index, future in enumerate(as_completed(futures), start=1):
@@ -1006,22 +1150,88 @@ def build_sample_labels(samples: list[SampleConfig], label_columns: list[str]) -
     return labels
 
 
-def describe_y_axis(region_rows: list[dict[str, str | int]]) -> str:
+def describe_y_axis(
+    region_rows: list[dict[str, str | int]],
+    reference_size: int | None = None,
+) -> str:
     flank_pairs = {
         (int(row.get("flank_left_bp", 0)), int(row.get("flank_right_bp", 0)))
         for row in region_rows
     }
     if not flank_pairs or flank_pairs == {(0, 0)}:
-        return "Read length"
-
-    if len(flank_pairs) == 1:
+        base_label = "Read length"
+    elif len(flank_pairs) == 1:
         flank_left_bp, flank_right_bp = next(iter(flank_pairs))
-        return (
+        base_label = (
             "Read length minus "
             f"{flank_left_bp + flank_right_bp} bp flanks"
         )
+    else:
+        base_label = "Flank-adjusted read length"
 
-    return "Flank-adjusted read length"
+    if reference_size is not None:
+        return f"{base_label} minus {reference_size} bp reference allele"
+    return base_label
+
+
+def build_color_column_palette(
+    samples: list[SampleConfig], color_column: str
+) -> dict[str, str]:
+    import matplotlib.pyplot as plt
+
+    col = normalize_column_name(color_column)
+    values: list[str] = []
+    for sample in samples:
+        if col == "sample":
+            val = sample.sample
+        elif col == "software":
+            val = sample.software
+        elif col == "flank_bp":
+            val = str(sample.flank_bp)
+        else:
+            val = sample.metadata.get(col, "")
+        if val not in values:
+            values.append(val)
+
+    cmap = plt.get_cmap("tab20" if len(values) > 10 else "tab10")
+    return {v: cmap(i / max(len(values) - 1, 1)) for i, v in enumerate(values)}
+
+
+def get_sample_color_column_value(sample: SampleConfig, color_column: str) -> str:
+    col = normalize_column_name(color_column)
+    if col == "sample":
+        return sample.sample
+    if col == "software":
+        return sample.software
+    if col == "flank_bp":
+        return str(sample.flank_bp)
+    return sample.metadata.get(col, "")
+
+
+def get_sample_metadata_value(sample: SampleConfig, column: str) -> str:
+    col = normalize_column_name(column)
+    if col == "sample":
+        return sample.sample
+    if col == "software":
+        return sample.software
+    if col == "flank_bp":
+        return str(sample.flank_bp)
+    return sample.metadata.get(col, "")
+
+
+def _sort_key_for_sample(sample: SampleConfig, sort_columns: list[str]) -> tuple:
+    key: list[str] = []
+    for col in sort_columns:
+        col_norm = normalize_column_name(col)
+        if col_norm == "sample":
+            key.append(sample.sample)
+        elif col_norm == "software":
+            key.append(sample.software)
+        elif col_norm == "flank_bp":
+            key.append(str(sample.flank_bp).zfill(10))
+        else:
+            key.append(sample.metadata.get(col_norm, ""))
+    return tuple(key)
 
 
 def plot_target_region(
@@ -1032,71 +1242,166 @@ def plot_target_region(
     label_columns: list[str],
     figure_prefix: str,
     random_seed: int = 42,
+    label_rotation: int = 0,
+    fontsize: int = 11,
+    no_haplotype_color: bool = False,
+    color_column: str | None = None,
+    sort_columns: list[str] | None = None,
+    sample_separators: bool = False,
+    separator_column: str | None = None,
+    group_label_column: str | None = None,
+    figure_width_per_sample: float = 1.1,
+    figure_height: float = 8.0,
+    reference_size: int | None = None,
 ) -> Path:
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    if sort_columns:
+        samples = sorted(samples, key=lambda s: _sort_key_for_sample(s, sort_columns))
     sample_order = [sample.sample for sample in samples]
     sample_positions = {sample_name: index for index, sample_name in enumerate(sample_order)}
     sample_labels = build_sample_labels(samples, label_columns)
     region_rows = [row for row in read_rows if row["region"] == target.region]
 
-    figure_width = max(12.0, len(samples) * 0.7)
-    fig, ax = plt.subplots(figsize=(figure_width, 7))
+    figure_width = max(8.0, len(samples) * figure_width_per_sample)
+    fig, ax = plt.subplots(figsize=(figure_width, figure_height))
     rng = random.Random(f"{random_seed}:{target.region}")
+    y_offset = reference_size if reference_size is not None else 0
 
-    for hap in ("hap1", "hap2", "unknown"):
+    if color_column is not None:
+        sample_color_map = build_color_column_palette(samples, color_column)
+        sample_to_color_value = {
+            sample.sample: get_sample_color_column_value(sample, color_column)
+            for sample in samples
+        }
+        seen_labels: set[str] = set()
+        for row in region_rows:
+            sample_name = str(row["sample"])
+            color_value = sample_to_color_value.get(sample_name, "")
+            color = sample_color_map.get(color_value, "#888888")
+            base_x = sample_positions[sample_name]
+            x = base_x + rng.uniform(-0.22, 0.22)
+            y = int(row["read_length"]) - y_offset
+            label = color_value if color_value not in seen_labels else "_nolegend_"
+            seen_labels.add(color_value)
+            ax.scatter([x], [y], s=34, alpha=0.75, c=[color], edgecolors="black", linewidths=0.2, label=label)
+    elif no_haplotype_color:
         xs: list[float] = []
         ys: list[int] = []
         for row in region_rows:
-            if row["hap"] != hap:
-                continue
             base_x = sample_positions[str(row["sample"])]
             xs.append(base_x + rng.uniform(-0.22, 0.22))
-            ys.append(int(row["read_length"]))
+            ys.append(int(row["read_length"]) - y_offset)
         if xs:
-            ax.scatter(
-                xs,
-                ys,
-                s=34,
-                alpha=0.75,
-                c=PLOT_PALETTE[hap],
-                edgecolors="black",
-                linewidths=0.2,
-                label=hap,
-            )
+            ax.scatter(xs, ys, s=34, alpha=0.75, c="#4C78A8", edgecolors="black", linewidths=0.2)
+    else:
+        for hap in ("hap1", "hap2", "unknown"):
+            xs = []
+            ys = []
+            for row in region_rows:
+                if row["hap"] != hap:
+                    continue
+                base_x = sample_positions[str(row["sample"])]
+                xs.append(base_x + rng.uniform(-0.22, 0.22))
+                ys.append(int(row["read_length"]) - y_offset)
+            if xs:
+                ax.scatter(
+                    xs,
+                    ys,
+                    s=34,
+                    alpha=0.75,
+                    c=PLOT_PALETTE[hap],
+                    edgecolors="black",
+                    linewidths=0.2,
+                    label=hap,
+                )
 
+    ha = "center" if label_rotation in (0, 90, -90) else "right"
+    va = "top"
     ax.set_xticks(list(range(len(sample_order))))
     ax.set_xticklabels(
         [sample_labels[sample_name] for sample_name in sample_order],
-        rotation=90,
-        ha="center",
-        fontsize=8,
+        rotation=label_rotation,
+        ha=ha,
+        va=va,
+        rotation_mode="anchor" if label_rotation != 0 else None,
+        fontsize=fontsize,
     )
-    ax.set_xlabel("Sample")
-    ax.set_ylabel(describe_y_axis(region_rows))
-    ax.set_title(f"Read length distribution across samples\n{target.igv_locus}")
+    ax.set_xlabel("Sample", fontsize=fontsize + 1)
+    ax.set_ylabel(describe_y_axis(region_rows, reference_size=reference_size), fontsize=fontsize + 1)
+    ax.set_title(f"Read length distribution across samples\n{target.igv_locus}", fontsize=fontsize + 2)
+    ax.tick_params(axis="x", labelsize=fontsize, pad=10)
+    ax.tick_params(axis="y", labelsize=fontsize)
+    separator_positions: list[float] = []
+    if separator_column and len(samples) > 1:
+        for index in range(len(samples) - 1):
+            left_value = get_sample_metadata_value(samples[index], separator_column)
+            right_value = get_sample_metadata_value(samples[index + 1], separator_column)
+            if left_value != right_value:
+                separator_positions.append(index + 0.5)
+    elif sample_separators and len(sample_order) > 1:
+        separator_positions = [index + 0.5 for index in range(len(sample_order) - 1)]
+    for separator_x in separator_positions:
+        ax.axvline(separator_x, color="#BDBDBD", linewidth=0.6, alpha=0.65, zorder=0)
+
+    if group_label_column and samples:
+        group_start = 0
+        current_value = get_sample_metadata_value(samples[0], group_label_column)
+        groups: list[tuple[int, int, str]] = []
+        for index in range(1, len(samples)):
+            next_value = get_sample_metadata_value(samples[index], group_label_column)
+            if next_value != current_value:
+                groups.append((group_start, index - 1, current_value))
+                group_start = index
+                current_value = next_value
+        groups.append((group_start, len(samples) - 1, current_value))
+
+        group_label_y = -0.21 if label_rotation else -0.13
+        for start_index, end_index, group_value in groups:
+            if not group_value:
+                continue
+            group_center = (start_index + end_index) / 2
+            ax.text(
+                group_center,
+                group_label_y,
+                group_value,
+                transform=ax.get_xaxis_transform(),
+                ha="center",
+                va="top",
+                fontsize=fontsize + 1,
+                fontweight="bold",
+                clip_on=False,
+            )
+
     ax.grid(axis="y", color="#D9D9D9", linewidth=0.7)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
 
-    handles, labels = ax.get_legend_handles_labels()
-    if handles:
-        unique_labels: dict[str, object] = {}
-        for handle, label in zip(handles, labels):
-            unique_labels[label] = handle
-        ax.legend(
-            unique_labels.values(),
-            unique_labels.keys(),
-            title="Haplotype",
-            bbox_to_anchor=(1.01, 1),
-            loc="upper left",
-            frameon=True,
-        )
+    legend_title = color_column if color_column is not None else "Haplotype"
+    if color_column is not None or not no_haplotype_color:
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            unique_labels: dict[str, object] = {}
+            for handle, label in zip(handles, labels):
+                unique_labels[label] = handle
+            ax.legend(
+                unique_labels.values(),
+                unique_labels.keys(),
+                title=legend_title,
+                bbox_to_anchor=(1.01, 1),
+                loc="upper left",
+                frameon=True,
+                fontsize=fontsize - 1,
+            )
 
-    plt.tight_layout()
+    bottom_margin = 0.12 if label_rotation == 0 else min(0.34, 0.18 + len(label_columns) * 0.04)
+    if group_label_column:
+        bottom_margin = min(0.42, bottom_margin + 0.08)
+    fig.subplots_adjust(bottom=bottom_margin, right=0.84)
+    plt.tight_layout(rect=(0, bottom_margin - 0.08, 0.84, 1))
     output_path = output_dir / f"{figure_prefix}.{target.slug}.png"
     fig.savefig(output_path, bbox_inches="tight")
     plt.close(fig)
@@ -1129,8 +1434,25 @@ def run_workflow(
     require_region_in_all_samples: bool = True,
     figure_prefix: str = "read_length_by_sample",
     jobs: int = 1,
+    use_fasta: bool = False,
+    label_rotation: int = 0,
+    fontsize: int = 11,
+    no_haplotype_color: bool = False,
+    color_column: str | None = None,
+    sort_columns: list[str] | None = None,
+    sample_separators: bool = False,
+    separator_column: str | None = None,
+    group_label_column: str | None = None,
+    figure_width_per_sample: float = 1.1,
+    figure_height: float = 8.0,
+    subtract_reference_allele: bool = False,
 ) -> dict[str, object]:
     labels = label_columns or ["sample"]
+    if subtract_reference_allele and catalog_bed_path is None:
+        raise ValueError(
+            "--subtract-reference-allele requires --catalog-bed to be provided "
+            "so reference allele sizes can be looked up."
+        )
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     params_path = output_dir / "params.json"
@@ -1149,13 +1471,26 @@ def run_workflow(
             require_region_in_all_samples=require_region_in_all_samples,
             figure_prefix=figure_prefix,
             jobs=jobs,
+            use_fasta=use_fasta,
+            label_rotation=label_rotation,
+            fontsize=fontsize,
+            no_haplotype_color=no_haplotype_color,
+            color_column=color_column,
+            sort_columns=sort_columns,
+            sample_separators=sample_separators,
+            separator_column=separator_column,
+            group_label_column=group_label_column,
+            figure_width_per_sample=figure_width_per_sample,
+            figure_height=figure_height,
+            subtract_reference_allele=subtract_reference_allele,
         )
         write_json(params_path, run_parameters)
         LOGGER.info("Run started")
         LOGGER.info("Parameters written to %s", params_path)
 
-        ensure_bam_tools_available()
-        samples = load_sample_table(sample_table_path=sample_table_path)
+        if not use_fasta:
+            ensure_bam_tools_available()
+        samples = load_sample_table(sample_table_path=sample_table_path, use_fasta=use_fasta)
         targets = load_targets(region_text=region_text, bed_path=bed_path)
         temp_dir = get_output_tmp_dir(output_dir)
         LOGGER.info(
@@ -1179,11 +1514,18 @@ def run_workflow(
             jobs=jobs,
             target_chunks_by_sample=target_chunks_by_sample,
             temp_dir=temp_dir,
+            use_fasta=use_fasta,
         )
         if not read_rows:
             raise ValueError("No reads matched the requested loci.")
 
         summary_rows = summarize_read_rows(read_rows)
+
+        reference_sizes_by_region: dict[str, int] = {}
+        if subtract_reference_allele:
+            assert catalog_bed_path is not None
+            reference_sizes_by_region = load_catalog_reference_sizes(catalog_bed_path)
+
         figure_paths = [
             plot_target_region(
                 read_rows=read_rows,
@@ -1192,6 +1534,17 @@ def run_workflow(
                 output_dir=output_dir,
                 label_columns=labels,
                 figure_prefix=figure_prefix,
+                label_rotation=label_rotation,
+                fontsize=fontsize,
+                no_haplotype_color=no_haplotype_color,
+                color_column=color_column,
+                sort_columns=sort_columns,
+                sample_separators=sample_separators,
+                separator_column=separator_column,
+                group_label_column=group_label_column,
+                figure_width_per_sample=figure_width_per_sample,
+                figure_height=figure_height,
+                reference_size=reference_sizes_by_region.get(target.region) if subtract_reference_allele else None,
             )
             for target in targets
         ]

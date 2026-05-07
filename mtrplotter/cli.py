@@ -51,6 +51,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Columns to show in the x-axis labels. Default: sample",
     )
     parser.add_argument(
+        "--use-fasta",
+        action="store_true",
+        help=(
+            "Extract reads from trimmed_reads.fasta instead of trimmed_reads_to_poa.bam. "
+            "This includes reads that failed to align to the POA consensus "
+            "(e.g. rare somatic expansions that are much longer than the dominant allele). "
+            "Applies to medaka samples only; TRGT samples are unaffected."
+        ),
+    )
+    parser.add_argument(
         "--keep-length-one",
         action="store_true",
         help="Keep reads with length 1 instead of filtering them out.",
@@ -71,7 +81,80 @@ def build_parser() -> argparse.ArgumentParser:
         default=1,
         help=(
             "Number of samples to process in parallel. "
-            "Use a moderate value on shared storage because all extraction runs through BAMs."
+            "Use a moderate value on shared storage."
+        ),
+    )
+    parser.add_argument(
+        "--label-rotation",
+        type=int,
+        default=0,
+        help="Rotation angle for x-axis tick labels in degrees. Default: 0 (horizontal).",
+    )
+    parser.add_argument(
+        "--fontsize",
+        type=int,
+        default=11,
+        help="Font size for x-axis tick labels. Axis labels and title scale proportionally. Default: 11.",
+    )
+    parser.add_argument(
+        "--figure-width-per-sample",
+        type=float,
+        default=1.1,
+        help="Figure width contribution per sample in inches. Default: 1.1.",
+    )
+    parser.add_argument(
+        "--figure-height",
+        type=float,
+        default=8.0,
+        help="Figure height in inches. Default: 8.0.",
+    )
+    parser.add_argument(
+        "--no-haplotype-color",
+        action="store_true",
+        help="Plot all reads in a single color without haplotype distinction or legend.",
+    )
+    parser.add_argument(
+        "--color-column",
+        default=None,
+        help=(
+            "Color reads by a metadata column (e.g. donor). "
+            "Overrides haplotype coloring. Each unique value gets a distinct color."
+        ),
+    )
+    parser.add_argument(
+        "--sort-columns",
+        nargs="+",
+        default=None,
+        help="Sort samples on the x-axis by these metadata columns (e.g. donor source cell_type).",
+    )
+    parser.add_argument(
+        "--sample-separators",
+        action="store_true",
+        help="Draw vertical separator lines between adjacent samples.",
+    )
+    parser.add_argument(
+        "--separator-column",
+        default=None,
+        help=(
+            "Draw vertical separator lines only when this sample metadata value "
+            "changes between adjacent x-axis samples, e.g. donor."
+        ),
+    )
+    parser.add_argument(
+        "--group-label-column",
+        default=None,
+        help=(
+            "Draw one centered label below each contiguous block where this "
+            "sample metadata value is constant, e.g. donor."
+        ),
+    )
+    parser.add_argument(
+        "--subtract-reference-allele",
+        action="store_true",
+        help=(
+            "Subtract the reference allele size (catalog end - start, looked up "
+            "from --catalog-bed) from the y-axis read length on each plot. "
+            "Requires --catalog-bed."
         ),
     )
     return parser
@@ -93,6 +176,18 @@ def main(argv: list[str] | None = None) -> int:
         require_region_in_all_samples=not args.allow_missing_regions_in_samples,
         figure_prefix=args.figure_prefix,
         jobs=args.jobs,
+        use_fasta=args.use_fasta,
+        label_rotation=args.label_rotation,
+        fontsize=args.fontsize,
+        no_haplotype_color=args.no_haplotype_color,
+        color_column=args.color_column,
+        sort_columns=args.sort_columns,
+        sample_separators=args.sample_separators,
+        separator_column=args.separator_column,
+        group_label_column=args.group_label_column,
+        figure_width_per_sample=args.figure_width_per_sample,
+        figure_height=args.figure_height,
+        subtract_reference_allele=args.subtract_reference_allele,
     )
 
     print(f"Figures written: {len(result['figure_paths'])}")
